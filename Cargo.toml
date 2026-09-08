@@ -6,8 +6,15 @@ description = "Shaicoin RandomX miner"
 
 [dependencies]
 tokio = { version = "1.40.0", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-native-tls = "0.2.12"
+# rustls with bundled roots, not native-tls: a released binary linking
+# OpenSSL dies with "libssl.so.3: cannot open shared object file" on any
+# machine whose OpenSSL differs from the build hosts. Bundled roots also
+# mean no dependency on a system trust store.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# rustls 0.23 refuses to pick a crypto provider implicitly and panics at
+# startup ("Could not automatically determine the process-level
+# CryptoProvider"). Pin ring and install it explicitly in main.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = "0.3.30"
 serde = { version = "1.0.210", features = ["derive"] }
 serde_json = "1.0.128"

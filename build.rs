@@ -8,6 +8,21 @@ fn main() {
         .build();
     println!("cargo:rustc-link-search=native={}/build", dst.display());
     println!("cargo:rustc-link-lib=static=randomx");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    // static, not dylib: an explicit dylib request here defeats
+    // -static-libstdc++ below and the release binary then needs a matching
+    // libstdc++ on every user machine.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "linux" {
+        println!("cargo:rustc-link-lib=static=stdc++");
+    } else if target_os == "macos" {
+        println!("cargo:rustc-link-lib=dylib=c++");
+    }
+    // RandomX is C++, so the binary otherwise needs libstdc++ at runtime and a
+    // release built here will not start on a host with an older one. Static
+    // linking leaves libc as the only real dependency.
+    if target_os == "linux" {
+        println!("cargo:rustc-link-arg=-static-libstdc++");
+        println!("cargo:rustc-link-arg=-static-libgcc");
+    }
     println!("cargo:rerun-if-changed=randomx/src");
 }

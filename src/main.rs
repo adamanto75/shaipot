@@ -35,6 +35,12 @@ struct KeyState { gen: u64, key: Option<Arc<RxKey>> }
 
 #[tokio::main]
 async fn main() {
+    // rustls 0.23 will not choose a provider for us; without this the process
+    // panics on the first TLS connection.
+    if rustls::crypto::ring::default_provider().install_default().is_err() {
+        eprintln!("warning: a rustls CryptoProvider was already installed");
+    }
+
     let args = Args::parse_and_validate();
 
     let max_workers = num_cpus::get();
