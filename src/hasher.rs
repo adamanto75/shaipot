@@ -1,127 +1,82 @@
-use hex;
+// Shaicoin proof of work, post 2026-09-01:
+//     H = SHA256d(header)          header is 112 bytes
+//     R = RandomX(seed, H)
+//     valid iff R <= target
 use primitive_types::U256;
 use sha2::{Digest, Sha256};
-// use warp::test::WsError;
-// use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
-use std::sync::mpsc;
-use super::vdf_solution::{HCGraphUtil, GRAPH_SIZE};
-// use super::models::{SubmitMessage, Job};
-use super::models::Job;
+use crate::randomx::RxVm;
 
-fn parse_header_time_from_data(header_data_hex: &str) -> u32 {
-    let time_start = 8 + 64 + 64;
-    let time_le = &header_data_hex[time_start..time_start + 8];
-    let mut bytes = [0u8; 4];
-    for i in 0..4 {
-        bytes[i] = u8::from_str_radix(&time_le[i * 2..i * 2 + 2], 16).unwrap();
-    }
-    u32::from_be_bytes([bytes[3], bytes[2], bytes[1], bytes[0]])
+// Serialized CBlockHeader (src/primitives/block.h):
+//    0 nVersion 4 | 4 hashPrevBlock 32 | 36 hashMerkleRoot 32
+//   68 nTime 4    | 72 nBits 4         | 76 nNonce 4
+//   80 hashExtCommitment 32           = 112 bytes
+// The nonce is NOT the trailing field the way Bitcoin's is: the extension
+// commitment follows it. Splice at byte 76, never append.
+pub const HEADER_BYTES: usize = 112;
+pub const HEADER_HEX_LEN: usize = HEADER_BYTES * 2; // 224
+pub const NONCE_HEX_START: usize = 76 * 2;          // 152
+pub const NONCE_HEX_LEN: usize = 8;
+
+/// Replace nNonce in a serialized header. `nonce_hex` is the four nonce bytes
+/// in header (little-endian) order and is sent to the pool verbatim, so there
+/// is no endianness question on the wire.
+pub fn splice_nonce(header_hex: &str, nonce_hex: &str) -> Option<String> {
+    if header_hex.len() < HEADER_HEX_LEN || nonce_hex.len() != NONCE_HEX_LEN { return None; }
+    let mut s = String::with_capacity(header_hex.len());
+    s.push_str(&header_hex[..NONCE_HEX_START]);
+    s.push_str(nonce_hex);
+    s.push_str(&header_hex[NONCE_HEX_START + NONCE_HEX_LEN..]);
+    Some(s)
 }
 
-// 新的返回类型：None表示没有找到解，Some(true)表示找到有效解并提交，Some(false)表示找到解但不满足难度要求
-pub fn compute_hash_no_vdf(
-    data: &str, 
-    hc_util: &mut HCGraphUtil, 
-    vdftime1: u64, 
-    vdftime2: u64,
-    hash_count: &Arc<AtomicUsize>,
-    api_hash_count: &Arc<AtomicUsize>,
-    job: &Job,
-    nonce: &str,
-    miner_id: &str,
-    server_sender: &mpsc::Sender<String>
-) -> Option<bool> {
-    // Create the vdfSolution array with all values set to 0xFFFF (uint16_t max value)
-    let vdf_solution: Vec<u16> = vec![0xFFFF; GRAPH_SIZE.into()];
+#[inline]
+pub fn sha256d(bytes: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(bytes);
+    let second = Sha256::digest(first);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&second);
+    out
+}
 
-    // Convert vdfSolution to a hex string
-    let vdf_solution_hex: String = vdf_solution
-        .iter()
-        .map(|&val| format!("{:04x}", val))
-        .collect();
+/// The consensus hash for a candidate header. Returns the raw 32 RandomX bytes.
+#[inline]
+pub fn pow_hash(vm: &mut RxVm, header_bytes: &[u8]) -> [u8; 32] {
+    vm.hash(&sha256d(header_bytes))
+}
 
-    // Append vdfSolution hex to the input data
-    let data_with_vdf = format!("{}{}", data, vdf_solution_hex);
+/// The node stores the RandomX output into a uint256 (little-endian internally)
+/// and compares with UintToArith256, so the raw bytes are read little-endian.
+/// The hex the pool logs is the reverse of these bytes.
+#[inline]
+pub fn hash_to_u256(raw: &[u8; 32]) -> U256 { U256::from_little_endian(raw) }
 
-    // Convert the hex string to bytes
-    let data_bytes = hex::decode(data_with_vdf).expect("Invalid hex input");
+/// Big-endian display form - what the pool and node print.
+pub fn hash_to_hex(raw: &[u8; 32]) -> String {
+    raw.iter().rev().map(|b| format!("{:02x}", b)).collect()
+}
 
-    // First SHA256 hash
-    let mut hasher = Sha256::new();
-    hasher.update(&data_bytes);
-    let hash1 = hasher.finalize();
-    
-    let hash1_reversed = hex::encode(hash1.iter().rev().cloned().collect::<Vec<u8>>());
-    let graph_hash_u256 = U256::from_str_radix(&hash1_reversed, 16).unwrap();
-
-    // Get worker and queen bee grid sizes
-    let hash1_hex = format!("{:064x}", graph_hash_u256);
-    let worker_grid_size = hc_util.get_worker_grid_size(&hash1_hex);
-    let queen_bee_grid_size = hc_util.get_queen_bee_grid_size(worker_grid_size);
-
-    let _header_time = parse_header_time_from_data(data);
-    
-    // 现在不需要判断V2了 因为已经确认我们在V2。
-    // let worker_path = hc_util.find_hamiltonian_cycle_v3_hex(&hash1_hex, worker_grid_size, 500, vdftime1);
-    let worker_path = hc_util.find_hamiltonian_cycle_v3_hex(&hash1_hex, worker_grid_size, 500, vdftime1);
-    
-
-    if worker_path.is_empty() {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn splice_lands_at_byte_76() {
+        let h = "ab".repeat(112);
+        let s = splice_nonce(&h, "deadbeef").unwrap();
+        assert_eq!(s.len(), 224);
+        assert_eq!(&s[152..160], "deadbeef");
+        assert_eq!(&s[..152], &h[..152]);
+        assert_eq!(&s[160..], &h[160..], "the 32-byte ext commitment must survive");
     }
-
-    // Bitcoin Core HashWriter serialization: << worker_solution << first_hash
-    let mut queen_hash_data = Vec::new();
-     
-    // Serialize vector size as compact integer (Bitcoin Core style)
-    let size = worker_path.len();
-    if size < 0xfd {
-        queen_hash_data.push(size as u8);
-    } else if size <= 0xffff {
-        queen_hash_data.push(0xfd);
-        queen_hash_data.extend(&(size as u16).to_le_bytes());
-    } else {
-        queen_hash_data.push(0xfe);
-        queen_hash_data.extend(&(size as u32).to_le_bytes());
+    #[test]
+    fn rejects_bad_input() {
+        assert!(splice_nonce(&"ab".repeat(112), "dead").is_none());
+        assert!(splice_nonce("abcd", "deadbeef").is_none());
     }
-     
-    // Serialize each uint16_t in little-endian format
-    for &val in &worker_path {
-        queen_hash_data.extend(&val.to_le_bytes());
+    #[test]
+    fn endianness_matches_the_node() {
+        // raw little-endian 0x01 in the low byte -> displayed hex ends ...01
+        let mut raw = [0u8; 32]; raw[0] = 1;
+        assert_eq!(hash_to_u256(&raw), U256::one());
+        assert!(hash_to_hex(&raw).ends_with("01"));
     }
-     
-    // Append first_hash bytes (32 bytes)
-    let mut hash1_bytes = hex::decode(&hash1_hex).expect("Invalid hex");
-    hash1_bytes.reverse();
-    queen_hash_data.extend(&hash1_bytes);
-     
-    let mut queen_hasher = Sha256::new();
-    queen_hasher.update(&queen_hash_data);
-    let queen_hash = queen_hasher.finalize();
-    let queen_hash_reversed = hex::encode(queen_hash.iter().rev().cloned().collect::<Vec<u8>>());
-
-    // 调用修改后的find_hamiltonian_cycle_v3_hex_second函数，它现在包含了所有后续处理逻辑
-    if let Some(result) = hc_util.find_hamiltonian_cycle_v3_hex_second(
-        &queen_hash_reversed, 
-        queen_bee_grid_size, 
-        125,
-        vdftime2,
-        &worker_path,
-        data,
-        job,
-        miner_id,
-        nonce,
-        server_sender,
-        hash_count,
-        api_hash_count
-    ) {
-        if result {
-            return Some(true); // 找到有效解，立即返回
-        }
-    }
-    
-    // 如果所有worker_path都处理完但没有找到有效解，返回Some(false)
-    Some(false)
 }

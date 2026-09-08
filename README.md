@@ -1,99 +1,52 @@
+# shaipot - Shaicoin RandomX miner
 
-```
-OPENSSL_DIR=/usr OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include/openssl CC=gcc CXX=g++ cargo build --release
-```
-# Shaipot - Shaicoin Miner
+Shaicoin replaced its ShaiHive (Hamiltonian cycle) proof of work with a
+vendored RandomX fork on 2026-09-01. This is that miner.
 
-Welcome to **Shaipot**, a Shaicoin miner written in Rust. Shaipot is designed for efficiency and speed, supporting multi-threaded mining with minimal setup.
+## Why not xmrig
 
-## Getting Started
+Shaicoin's RandomX changes the Argon2 salt to `ShaicoinRandomX-v2\x01` and
+rebalances six instruction frequencies, specifically so Monero hashpower cannot
+be repointed at it. A stock xmrig or any crates.io randomx runs at full speed
+and produces hashes this chain has never seen - with no error anywhere. This
+miner links the exact RandomX vendored in the node tree, and a unit test pins
+the known-answer vector so a wrong build fails `cargo test` instead of silently
+mining nothing.
 
-To start mining with **Shaipot**, you need to provide the necessary arguments to connect to a mining pool and specify your Shaicoin address. Let's walk through how to set up and start mining.
+## Build
 
-### Required Arguments
+    cargo build --release
 
-- `--address <shaicoin_address>`  
-  Your **Shaicoin address** where you want your mining rewards to be sent.
-  
-- `--pool <POOL_URL>`  
-  The **pool URL** to which your miner will connect for jobs. This should be a valid WebSocket URL for the pool.
+Needs cmake and a C++ compiler; RandomX is built from `randomx/`.
 
-### Optional Arguments
+## Run
 
-- `--threads <AMT>`  
-  Specifies the number of threads to use for mining. By default, the miner will automatically detect the optimal number of threads based on your system's available cores, but you can override this by specifying a value manually.
+    ./target/release/shaipot \
+      --address sh1q... \
+      --pool wss://mine.shaicoin-mining.com/ \
+      --threads 4
 
-- `--vdftime1 <MILLISECONDS>`  
-  Specifies the timeout in milliseconds for the Hamiltonian path search in the first graph (worker graph). Default is 1000ms. This controls how long the miner will search for a valid path in the primary mining graph before giving up.
+Options:
+  --threads N   worker threads (default: all cores)
+  --light       ~256 MB instead of a 2.3 GB dataset, roughly 10x slower
 
-- `--vdftime2 <MILLISECONDS>`  
-  Specifies the timeout in milliseconds for the Hamiltonian path search in the second graph (queen bee graph). Default is 10ms. This controls the timeout for the secondary graph used in the mining algorithm. 
+## Huge pages
 
-## Compilation
+Fast mode allocates a 2.3 GB dataset. Huge pages are worth 20-30%:
 
-To compile **Shaipot** with optimal performance, use the provided build script:
+    sudo sysctl -w vm.nr_hugepages=1280
 
-```bash
-./build.sh
-```
+The miner prints whether it got them. Without them it still works, just slower.
 
-This script will compile the project with the highest optimization settings for your CPU, ensuring maximum performance during mining.
+## Protocol
 
-After compilation, the resulting executable will be located in the `target/release` directory. You can run it from there using the following command:
+    pool -> miner  {"type":"job","job_id":..,"data":<224 hex>,"seed":<120 hex>,"target":<64 hex>}
+    miner -> pool  {"type":"submit","miner_id":"sh1q..","job_id":..,"nonce":<8 hex>}
 
-```bash
-./target/release/shaipot --address <shaicoin_address> --pool <POOL_URL> [--threads <AMT>] [--vdftime1 <MILLISECONDS>] [--vdftime2 <MILLISECONDS>]
-```
+`data` is the serialized 112-byte header. The nonce is spliced at **byte 76**,
+not appended - the 32-byte extension commitment follows it, unlike Bitcoin's
+80-byte header where the nonce is last. `nonce` is those four bytes in header
+(little-endian) order, sent verbatim.
 
-Make sure to replace `<shaicoin_address>` and `<POOL_URL>` with your actual Shaicoin address and the pool URL you're using.
-
-## Running the Program
-
-Once compiled, **Shaipot** is ready to run! Simply use the command provided above, specifying your Shaicoin address, the pool URL, and (optionally) the number of threads. Here's an example:
-
-```bash
-./target/release/shaipot --address sh1qeexkz69dz6j4q0zt0pkn36650yevwc8eksqeuu --pool wss://pool.shaicoin.org --threads 4
-```
-
-Example usage with custom vdftime parameters:
-```bash
-./target/release/shaipot --address sh1qeexkz69dz6j4q0zt0pkn36650yevwc8eksqeuu --pool wss://pool.shaicoin.org --threads 4 --vdftime1 1500 --vdftime2 15
-```
-
-You can also specify just one of the vdftime parameters:
-```bash
-./target/release/shaipot --address sh1qeexkz69dz6j4q0zt0pkn36650yevwc8eksqeuu --pool wss://pool.shaicoin.org --vdftime2 15
-```
-
-This will start the mining process, and you'll see output as **Shaipot** connects to the pool and begins mining.
-
-```plaintext
-                          __
-                         // \
-                         \\_/ // 
-    brrr''-.._.-''-.._.. -(||)(')
-                         '''  
-        _
-     __( )_
-    (      (o____
-     |          |
-     |      (__/
-       \     /   ___
-       /     \  \___/
-     /    ^    /     \
-    |   |  |__|_ SHA  |
-    |    \______)____/
-     \         /
-       \     /_
-        |  ( __)
-        (____)
-```
-
-Happy Mining!
-
-# Update Log
-
-**2025-11-24**
-
-In the process of graph search, we first calculate the edges and then conduct the search, which can improve the speed of path search to a certain extent.
-In addition, vdftime1 and vdftime2 can be specified by yourself based on the performance of the device
+Proof of work is `RandomX(seed, SHA256d(header)) <= target`, with the RandomX
+output read little-endian, matching the node's uint256 handling.
