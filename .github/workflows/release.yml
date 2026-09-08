@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v3.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 rather than latest: the binary is built against that
+          # glibc, so building on a newer runner would refuse to start on
+          # anything older.
+          - os: ubuntu-22.04
+            name: linux-x86_64
+            bin: shaipot
+            archive: tar.gz
+          - os: windows-latest
+            name: windows-x86_64
+            bin: shaipot.exe
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Show runtime dependencies (linux)
+        if: runner.os == 'Linux'
+        run: ldd target/release/shaipot || true
+
+      - name: Package (linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          STAGE="shaipot-${{ matrix.name }}"
+          mkdir -p "$STAGE"
+          cp target/release/${{ matrix.bin }} "$STAGE"/
+          cp README.md "$STAGE"/
+          cp randomx/LICENSE "$STAGE"/LICENSE.randomx
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "shaipot-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "target/release/${{ matrix.bin }}" $stage
+          Copy-Item README.md $stage
+          Copy-Item randomx/LICENSE "$stage/LICENSE.randomx"
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower() + "  $stage.zip" |
+            Out-File -Encoding ascii "$stage.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaipot-${{ matrix.name }}
+          path: |
+            shaipot-${{ matrix.name }}.tar.gz
+            shaipot-${{ matrix.name }}.tar.gz.sha256
+            shaipot-${{ matrix.name }}.zip
+            shaipot-${{ matrix.name }}.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -la dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: shaipot ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+          body: |
+            Shaicoin RandomX CPU miner.
+
+            **Verify your download** against the `.sha256` file next to it.
+
+            ```
+            ./shaipot --address sh1q... --pool wss://mine.shaicoin-mining.com/ --threads 4
+            ```
+
+            Fast mode allocates a 2.3 GB RandomX dataset. Huge pages are worth
+            20-30%: `sudo sysctl -w vm.nr_hugepages=1280`. Use `--light` to run
+            in ~256 MB instead, at roughly a tenth of the speed.
+
+            Linux builds are made on Ubuntu 22.04 and link libstdc++ statically,
+            so they need only glibc 2.35 or newer.
+
+            Every build runs the Shaicoin RandomX known-answer test first: this
+            chain uses a custom Argon2 salt and rebalanced instruction
+            frequencies, and a stock RandomX would mine at full speed while
+            producing hashes the chain has never seen.
