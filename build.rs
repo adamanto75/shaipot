@@ -6,7 +6,12 @@ fn main() {
         .define("CMAKE_BUILD_TYPE", "Release")
         .build_target("randomx")
         .build();
+    // Single-config generators (Make, Ninja) put the library in build/;
+    // MSVC is multi-config and puts it in build/Release/. Emit both - a
+    // search path that does not exist is ignored, and without the second one
+    // Windows fails at link with LNK1181 cannot open input file randomx.lib.
     println!("cargo:rustc-link-search=native={}/build", dst.display());
+    println!("cargo:rustc-link-search=native={}/build/Release", dst.display());
     println!("cargo:rustc-link-lib=static=randomx");
     // static, not dylib: an explicit dylib request here defeats
     // -static-libstdc++ below and the release binary then needs a matching
