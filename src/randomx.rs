@@ -7,6 +7,7 @@
 
 use std::os::raw::{c_int, c_ulong, c_void};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[allow(non_camel_case_types)] pub enum randomx_cache {}
 #[allow(non_camel_case_types)] pub enum randomx_dataset {}
@@ -109,6 +110,25 @@ impl RxKey {
     }
 }
 
+/// Free `key` as soon as nothing else holds it.
+///
+/// On a key rotation the old dataset has to be gone before the new one is
+/// allocated: a node reserves huge pages for one 2 GB dataset, and allocating
+/// the new one first pushed it onto ordinary pages at a ~10% hashrate loss.
+/// Workers drop their VMs (and with them their Arc) when they see the key
+/// generation change; this waits up to `timeout` for that, then drops the last
+/// reference here, which releases the dataset and cache. Returns true if the
+/// memory was freed, false if something still held the key at the deadline.
+pub fn retire_key(key: Arc<RxKey>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Arc::strong_count(&key) > 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let last = Arc::strong_count(&key) == 1;
+    drop(key);
+    last
+}
+
 impl Drop for RxKey {
     fn drop(&mut self) {
         unsafe {
@@ -150,5 +170,48 @@ mod tests {
         assert_eq!(got, "1e3ede7f49c31a77fe72bc54441f490da2a158a1d8ea7920c2bd46c80ea6bad2",
             "not the Shaicoin RandomX config - a stock build gives \
              d6f97cc88f167c7917c6982b7e8ca5f0d82b8cefbf0242d18b34a5edfe92f265");
+    }
+
+    #[test]
+    fn retire_key_waits_for_the_last_vm() {
+        let k = RxKey::new(b"shaicoin-randomx-kat-key-v1", false, 1).expect("cache");
+        // Like a mining worker: the thread builds its own VM (a VM is not Send)
+        // and keeps the key alive only through that VM.
+        let k2 = Arc::clone(&k);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let held = std::thread::spawn(move || {
+            let vm = k2.new_vm().expect("vm");
+            drop(k2);
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            drop(vm);
+        });
+        ready_rx.recv().unwrap();
+        let t = Instant::now();
+        assert!(retire_key(k, Duration::from_secs(5)), "the key was not freed");
+        assert!(t.elapsed() >= Duration::from_millis(150), "returned before the VM let go");
+        held.join().unwrap();
+    }
+
+    #[test]
+    fn retire_key_gives_up_at_the_deadline() {
+        let k = RxKey::new(b"shaicoin-randomx-kat-key-v1", false, 1).expect("cache");
+        let vm = k.new_vm().expect("vm");
+        assert!(!retire_key(k, Duration::from_millis(100)), "claimed to free a key a VM still holds");
+        drop(vm);
+    }
+
+    // Needs about 2 x 1170 free 2 MiB huge pages to be meaningful, so it is
+    // not run by default:  cargo test --release -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn huge_pages_survive_a_key_rotation() {
+        let a = RxKey::new(b"rotation-test-key-A", true, 8).expect("dataset A");
+        if !a.large_pages { eprintln!("no huge pages for the first dataset; nothing to test"); return; }
+        let vm = a.new_vm().expect("vm");
+        drop(vm);
+        assert!(retire_key(a, Duration::from_secs(5)));
+        let b = RxKey::new(b"rotation-test-key-B", true, 8).expect("dataset B");
+        assert!(b.large_pages, "the new dataset fell back to ordinary pages after a rotation");
     }
 }

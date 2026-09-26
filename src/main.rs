@@ -14,7 +14,7 @@ mod randomx;
 use utils::*;
 use models::*;
 use hasher::*;
-use randomx::{RxKey, RxVm};
+use randomx::{RxKey, RxVm, retire_key};
 use rand::Rng;
 use colored::*;
 use std::thread;
@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use crate::api::MinerState;
 use primitive_types::U256;
 use futures_util::{StreamExt, SinkExt};
-use std::sync::{atomic::{AtomicUsize, Ordering}, mpsc};
+use std::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -63,19 +63,23 @@ async fn main() {
     let (server_sender, server_receiver) = mpsc::channel::<String>();
     let current_job: Arc<Mutex<Option<Job>>> = Arc::new(Mutex::new(None));
     let key_state = Arc::new(StdMutex::new(KeyState { gen: 0, key: None }));
+    // Mirrors key_state.gen so workers can notice a rotation mid-job without
+    // taking the lock on every batch of hashes.
+    let key_gen = Arc::new(AtomicU64::new(0));
 
     let miner_state = Arc::new(MinerState {
         hash_count: Arc::new(AtomicUsize::new(0)),
         accepted_shares: Arc::new(AtomicUsize::new(0)),
         rejected_shares: Arc::new(AtomicUsize::new(0)),
         hashrate_samples: Arc::new(Mutex::new(Vec::new())),
-        version: String::from("3.0.0"),
+        version: String::from("3.0.1"),
     });
 
     let hash_count = Arc::new(AtomicUsize::new(0));
     for _ in 0..num_workers {
         let current_job = Arc::clone(&current_job);
         let key_state = Arc::clone(&key_state);
+        let key_gen = Arc::clone(&key_gen);
         let hash_count = Arc::clone(&hash_count);
         let api_hash_count = Arc::clone(&miner_state.hash_count);
         let sender = server_sender.clone();
@@ -136,8 +140,10 @@ async fn main() {
                     }
 
                     // Check for a new job periodically rather than locking on
-                    // every single hash.
+                    // every single hash. A key rotation also ends the job, so
+                    // this worker drops its VM and the old dataset can be freed.
                     if i % 32 == 31 {
+                        if key_gen.load(Ordering::Relaxed) != my_gen { break; }
                         let changed = match current_job.blocking_lock().as_ref() {
                             Some(j) => j.job_id != job.job_id,
                             None => true,
@@ -230,6 +236,23 @@ async fn main() {
                             if need {
                                 let seed_bytes = match hex::decode(&seed) { Ok(b) => b, Err(_) => continue };
                                 println!("{}", "RandomX key changed; building (this takes a moment)...".bold().yellow());
+
+                                // Free the old dataset BEFORE allocating the new one.
+                                // Take the key out of the shared state and bump the
+                                // generation: workers stop, drop their VMs, and the
+                                // last reference goes away. Hashing the old key is
+                                // wasted work anyway once the network has moved on.
+                                let old = { let mut ks = key_state.lock().unwrap();
+                                    let old = ks.key.take(); ks.gen = ks.gen.wrapping_add(1);
+                                    key_gen.store(ks.gen, Ordering::Relaxed); old };
+                                if let Some(old) = old {
+                                    let freed = tokio::task::spawn_blocking(move || retire_key(old, Duration::from_secs(30)))
+                                        .await.unwrap_or(false);
+                                    if !freed {
+                                        println!("{}", "Old RandomX dataset still in use after 30s; allocating the new one alongside it".yellow());
+                                    }
+                                }
+
                                 let fast = !args.light;
                                 let nthreads = num_workers;
                                 let built = tokio::task::spawn_blocking(move || RxKey::new(&seed_bytes, fast, nthreads)).await.ok().flatten();
@@ -240,6 +263,7 @@ async fn main() {
                                             if k.large_pages { "ON" } else { "OFF, hashrate will be substantially lower" }).bold().green());
                                         let mut ks = key_state.lock().unwrap();
                                         ks.key = Some(k); ks.gen = ks.gen.wrapping_add(1);
+                                        key_gen.store(ks.gen, Ordering::Relaxed);
                                     }
                                     None => { println!("{}", "Failed to allocate RandomX; try --light".bold().red()); continue; }
                                 }
